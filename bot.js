@@ -1,216 +1,182 @@
 import Anthropic from "@anthropic-ai/sdk";
 import TelegramBot from "node-telegram-bot-api";
+import OpenAI from "openai";
+import https from "https";
 import fs from "fs";
 
 // ============================================================
-// CONFIGURAÇÃO — coloque suas chaves aqui
+// VARIÁVEIS DE AMBIENTE — configure no Railway
 // ============================================================
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const TRELLO_API_KEY = process.env.TRELLO_API_KEY;
+const TRELLO_TOKEN = process.env.TRELLO_TOKEN;
 // ============================================================
 
 const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-// Arquivos de persistência
-const TASKS_FILE = "tasks.json";
-const REMINDERS_FILE = "reminders.json";
-
-// Memória de conversa por usuário (mantida em RAM)
+// Histórico por usuário
 const historico = {};
 
-// ── Helpers de persistência ──────────────────────────────────
-function loadJSON(file) {
-  try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch {
-    return {};
-  }
+// ── MCP servers conectados ao Claude ─────────────────────────
+const MCP_SERVERS = [
+  {
+    type: "url",
+    url: "https://calendarmcp.googleapis.com/mcp/v1",
+    name: "google-calendar",
+  },
+  {
+    type: "url",
+    url: "https://gmailmcp.googleapis.com/mcp/v1",
+    name: "gmail",
+  },
+  {
+    type: "url",
+    url: "https://drivemcp.googleapis.com/mcp/v1",
+    name: "google-drive",
+  },
+];
+
+// ── System prompt ─────────────────────────────────────────────
+function buildSystemPrompt() {
+  const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" });
+  return `Você é o assistente pessoal da Rayla, estratégico, direto e eficiente.
+Data e hora atual: ${agora} (horário de Brasília)
+
+Você tem acesso direto a:
+- Google Calendar: ver compromissos, criar e editar eventos
+- Gmail: buscar e-mails, criar rascunhos
+- Google Drive: buscar e ler arquivos
+- Trello: gerenciar tarefas e projetos (use a API do Trello com key=${TRELLO_API_KEY} e token=${TRELLO_TOKEN})
+
+Quando a Rayla pedir algo, execute diretamente usando as ferramentas disponíveis sem pedir confirmação desnecessária.
+
+Seu papel é ajudá-la a:
+- Organizar a agenda e compromissos
+- Gerenciar e-mails importantes
+- Acompanhar projetos no Trello
+- Tirar ideias do papel e transformar em ações concretas
+- Manter o foco nas prioridades do dia
+
+Seja proativo: antecipe o que ela pode precisar, sugira próximos passos e ajude a executar.
+Responda sempre em português, de forma clara e direta.`;
 }
 
-function saveJSON(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
-}
-
-let tasks = loadJSON(TASKS_FILE); // { userId: [ {id, text, done} ] }
-let reminders = loadJSON(REMINDERS_FILE); // { userId: [ {id, text, time} ] }
-
-// ── Sistema de lembretes ─────────────────────────────────────
-function checkReminders() {
-  const now = new Date();
-  for (const userId in reminders) {
-    reminders[userId] = reminders[userId].filter((r) => {
-      const reminderTime = new Date(r.time);
-      if (reminderTime <= now) {
-        bot.sendMessage(userId, `⏰ *Lembrete:* ${r.text}`, {
-          parse_mode: "Markdown",
-        });
-        return false; // remove após disparar
-      }
-      return true;
-    });
-  }
-  saveJSON(REMINDERS_FILE, reminders);
-}
-
-// Verifica lembretes a cada minuto
-setInterval(checkReminders, 60_000);
-
-// ── Comandos rápidos ─────────────────────────────────────────
-bot.onText(/\/start/, (msg) => {
-  const name = msg.from.first_name || "você";
-  bot.sendMessage(
-    msg.chat.id,
-    `Olá, ${name}! 👋 Sou seu assistente pessoal.\n\n` +
-      `Posso te ajudar com:\n` +
-      `📋 /tarefas — ver suas tarefas\n` +
-      `✅ /feita <número> — marcar tarefa como concluída\n` +
-      `⏰ /lembretes — ver seus lembretes\n` +
-      `🗑️ /limpar — apagar histórico da conversa\n\n` +
-      `Ou simplesmente me manda uma mensagem! 😊`
-  );
-});
-
-bot.onText(/\/tarefas/, (msg) => {
-  const userId = String(msg.chat.id);
-  const lista = tasks[userId] || [];
-  if (lista.length === 0) {
-    return bot.sendMessage(msg.chat.id, "📋 Nenhuma tarefa por enquanto!");
-  }
-  const texto = lista
-    .map((t, i) => `${i + 1}. ${t.done ? "✅" : "⬜"} ${t.text}`)
-    .join("\n");
-  bot.sendMessage(msg.chat.id, `📋 *Suas tarefas:*\n${texto}`, {
-    parse_mode: "Markdown",
+// ── Chama a API do Claude com MCP ─────────────────────────────
+async function chamarClaude(mensagens) {
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "anthropic-beta": "mcp-client-2025-04-04",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 2000,
+      system: buildSystemPrompt(),
+      messages: mensagens,
+      mcp_servers: MCP_SERVERS,
+    }),
   });
-});
 
-bot.onText(/\/feita (\d+)/, (msg, match) => {
-  const userId = String(msg.chat.id);
-  const index = parseInt(match[1]) - 1;
-  if (tasks[userId]?.[index]) {
-    tasks[userId][index].done = true;
-    saveJSON(TASKS_FILE, tasks);
-    bot.sendMessage(
-      msg.chat.id,
-      `✅ Tarefa "${tasks[userId][index].text}" marcada como concluída!`
-    );
-  } else {
-    bot.sendMessage(msg.chat.id, "❌ Número de tarefa inválido.");
-  }
-});
+  return response.json();
+}
 
-bot.onText(/\/lembretes/, (msg) => {
-  const userId = String(msg.chat.id);
-  const lista = reminders[userId] || [];
-  if (lista.length === 0) {
-    return bot.sendMessage(msg.chat.id, "⏰ Nenhum lembrete agendado!");
-  }
-  const texto = lista
-    .map((r, i) => `${i + 1}. ${r.text} — ${new Date(r.time).toLocaleString("pt-BR")}`)
-    .join("\n");
-  bot.sendMessage(msg.chat.id, `⏰ *Seus lembretes:*\n${texto}`, {
-    parse_mode: "Markdown",
-  });
-});
-
-bot.onText(/\/limpar/, (msg) => {
-  const userId = String(msg.chat.id);
-  historico[userId] = [];
-  bot.sendMessage(msg.chat.id, "🗑️ Histórico da conversa apagado!");
-});
-
-// ── Mensagens livres → Claude ────────────────────────────────
-bot.on("message", async (msg) => {
-  if (msg.text?.startsWith("/")) return; // ignora comandos
-
-  const userId = String(msg.chat.id);
-  const texto = msg.text;
-
+// ── Processa mensagem ─────────────────────────────────────────
+async function processarMensagem(userId, texto) {
   if (!historico[userId]) historico[userId] = [];
   historico[userId].push({ role: "user", content: texto });
 
-  // Contexto atual de tarefas e lembretes para o Claude
-  const tarefasAtivas = (tasks[userId] || [])
-    .filter((t) => !t.done)
-    .map((t, i) => `${i + 1}. ${t.text}`)
-    .join("\n") || "Nenhuma";
+  const mensagens = historico[userId].slice(-20);
+  const data = await chamarClaude(mensagens);
 
-  const lembretesAtivos = (reminders[userId] || [])
-    .map((r, i) => `${i + 1}. ${r.text} em ${new Date(r.time).toLocaleString("pt-BR")}`)
-    .join("\n") || "Nenhum";
+  const textoResposta = data.content
+    ?.filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("\n") || "Não consegui processar sua mensagem.";
 
-  const systemPrompt = `Você é um assistente pessoal eficiente e simpático, integrado ao Telegram.
+  if (textoResposta.trim()) {
+    historico[userId].push({ role: "assistant", content: textoResposta });
+  }
 
-Você pode ajudar o usuário com:
-1. **Tarefas (to-do):** Se o usuário pedir para adicionar uma tarefa, responda EXATAMENTE neste formato JSON (e nada mais além do JSON + sua mensagem):
-   {"action":"add_task","text":"descrição da tarefa"}
-   
-2. **Lembretes:** Se o usuário pedir um lembrete com data/hora, responda com:
-   {"action":"add_reminder","text":"descrição","time":"ISO8601"}
-   Use o fuso horário de Brasília (UTC-3). Data de hoje: ${new Date().toLocaleDateString("pt-BR")}, horário atual: ${new Date().toLocaleTimeString("pt-BR")}.
-   
-3. **Resumos:** Resuma textos de forma clara e objetiva.
-4. **Respostas gerais:** Responda qualquer pergunta de forma útil e direta.
+  if (historico[userId].length > 30) {
+    historico[userId] = historico[userId].slice(-30);
+  }
 
-Estado atual do usuário:
-- Tarefas pendentes: ${tarefasAtivas}
-- Lembretes ativos: ${lembretesAtivos}
+  return textoResposta;
+}
 
-Se for uma ação (add_task ou add_reminder), coloque o JSON na PRIMEIRA linha, depois uma mensagem amigável confirmando.
-Para todo o resto, responda normalmente em português.`;
+// ── Comandos ──────────────────────────────────────────────────
+bot.onText(/\/start/, (msg) => {
+  bot.sendMessage(
+    msg.chat.id,
+    `Olá, Rayla! 👋 Seu assistente pessoal está pronto.\n\n` +
+    `Tenho acesso direto a:\n` +
+    `📅 Google Calendar — ver e criar eventos\n` +
+    `📧 Gmail — buscar e-mails e criar rascunhos\n` +
+    `📁 Google Drive — buscar e ler arquivos\n` +
+    `📋 Trello — ver e gerenciar tarefas\n\n` +
+    `Você também pode me mandar 🎤 áudios!\n\n` +
+    `É só falar o que precisa! 😊`
+  );
+});
 
+bot.onText(/\/limpar/, (msg) => {
+  historico[String(msg.chat.id)] = [];
+  bot.sendMessage(msg.chat.id, "🗑️ Histórico apagado!");
+});
+
+// ── Áudio ─────────────────────────────────────────────────────
+bot.on("voice", async (msg) => {
+  const userId = String(msg.chat.id);
   try {
     await bot.sendChatAction(msg.chat.id, "typing");
+    const fileUrl = await bot.getFileLink(msg.voice.file_id);
+    const audioPath = `/tmp/audio_${userId}.ogg`;
 
-    const resposta = await client.messages.create({
-     model: "claude-sonnet-4-6",
-      max_tokens: 1000,
-      system: systemPrompt,
-      messages: historico[userId],
+    await new Promise((resolve, reject) => {
+      const file = fs.createWriteStream(audioPath);
+      https.get(fileUrl, (res) => res.pipe(file).on("finish", resolve).on("error", reject));
     });
 
-    const conteudo = resposta.content[0].text;
+    const transcription = await openai.audio.transcriptions.create({
+      file: fs.createReadStream(audioPath),
+      model: "whisper-1",
+      language: "pt",
+    });
 
-    // Verifica se tem ação JSON na resposta
-    const primeiraLinha = conteudo.split("\n")[0].trim();
-    let mensagemFinal = conteudo;
+    const texto = transcription.text;
+    await bot.sendMessage(msg.chat.id, `🎤 _"${texto}"_`, { parse_mode: "Markdown" });
 
-    try {
-      const acao = JSON.parse(primeiraLinha);
+    const resposta = await processarMensagem(userId, texto);
+    if (resposta) bot.sendMessage(msg.chat.id, resposta);
 
-      if (acao.action === "add_task" && acao.text) {
-        if (!tasks[userId]) tasks[userId] = [];
-        tasks[userId].push({ id: Date.now(), text: acao.text, done: false });
-        saveJSON(TASKS_FILE, tasks);
-        mensagemFinal = conteudo.split("\n").slice(1).join("\n").trim();
-      }
-
-      if (acao.action === "add_reminder" && acao.text && acao.time) {
-        if (!reminders[userId]) reminders[userId] = [];
-        reminders[userId].push({ id: Date.now(), text: acao.text, time: acao.time });
-        saveJSON(REMINDERS_FILE, reminders);
-        mensagemFinal = conteudo.split("\n").slice(1).join("\n").trim();
-      }
-    } catch {
-      // Não era JSON, resposta normal
-    }
-
-   if (conteudo && conteudo.trim()) historico[userId].push({ role: "assistant", content: conteudo });
-
-    // Limita histórico a 20 mensagens para não estourar contexto
-    if (historico[userId].length > 20) {
-      historico[userId] = historico[userId].slice(-20);
-    }
-
-    bot.sendMessage(msg.chat.id, mensagemFinal || conteudo);
+    try { fs.unlinkSync(audioPath); } catch {}
   } catch (err) {
-    console.error("Erro:", err);
-    bot.sendMessage(
-      msg.chat.id,
-      "⚠️ Ocorreu um erro ao processar sua mensagem. Tente novamente."
-    );
+    console.error("Erro no áudio:", err);
+    bot.sendMessage(msg.chat.id, "⚠️ Não consegui transcrever o áudio. Tenta de novo!");
   }
 });
 
-console.log("🤖 Bot iniciado! Aguardando mensagens...");
+// ── Texto ─────────────────────────────────────────────────────
+bot.on("message", async (msg) => {
+  if (msg.text?.startsWith("/") || msg.voice) return;
+  if (!msg.text) return;
+
+  const userId = String(msg.chat.id);
+  try {
+    await bot.sendChatAction(msg.chat.id, "typing");
+    const resposta = await processarMensagem(userId, msg.text);
+    if (resposta) bot.sendMessage(msg.chat.id, resposta);
+  } catch (err) {
+    console.error("Erro:", err);
+    bot.sendMessage(msg.chat.id, "⚠️ Ocorreu um erro. Tenta de novo!");
+  }
+});
+
+console.log("🤖 Assistente da Rayla iniciado!");
