@@ -1,44 +1,98 @@
 import Anthropic from "@anthropic-ai/sdk";
 import TelegramBot from "node-telegram-bot-api";
-import OpenAI from "openai";
-import https from "https";
 import fs from "fs";
+import fetch from "node-fetch";
 
 // ============================================================
-// VARIÁVEIS DE AMBIENTE — configure no Railway
+// VARIÁVEIS DE AMBIENTE
 // ============================================================
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const TRELLO_API_KEY = process.env.TRELLO_API_KEY;
 const TRELLO_TOKEN = process.env.TRELLO_TOKEN;
 // ============================================================
 
 const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
 // Histórico por usuário
 const historico = {};
 
-// ── MCP servers conectados ao Claude ─────────────────────────
-const MCP_SERVERS = [
+// ── Trello ────────────────────────────────────────────────────
+async function trelloRequest(method, path, body = null) {
+  const url = `https://api.trello.com/1${path}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
+  const options = { method, headers: { "Content-Type": "application/json" } };
+  if (body) options.body = JSON.stringify(body);
+  const res = await fetch(url, options);
+  return res.json();
+}
+
+// ── Tools para o Claude ───────────────────────────────────────
+const tools = [
   {
-    type: "url",
-    url: "https://calendarmcp.googleapis.com/mcp/v1",
-    name: "google-calendar",
+    name: "listar_trello",
+    description: "Lista os quadros e cards do Trello. Use quando o usuário perguntar sobre tarefas, projetos ou Trello.",
+    input_schema: { type: "object", properties: {}, required: [] },
   },
   {
-    type: "url",
-    url: "https://gmailmcp.googleapis.com/mcp/v1",
-    name: "gmail",
-  },
-  {
-    type: "url",
-    url: "https://drivemcp.googleapis.com/mcp/v1",
-    name: "google-drive",
+    name: "criar_card_trello",
+    description: "Cria um card no Trello. Use quando o usuário pedir para adicionar uma tarefa no Trello.",
+    input_schema: {
+      type: "object",
+      properties: {
+        nome_lista: { type: "string", description: "Nome da lista onde criar o card" },
+        nome_card: { type: "string", description: "Nome do card" },
+        descricao: { type: "string", description: "Descrição opcional do card" },
+      },
+      required: ["nome_lista", "nome_card"],
+    },
   },
 ];
+
+// ── Executa ferramentas ───────────────────────────────────────
+async function executarFerramenta(nome, input) {
+  try {
+    if (nome === "listar_trello") {
+      const boards = await trelloRequest("GET", "/members/me/boards");
+      if (!boards || boards.length === 0) return "Nenhum quadro encontrado no Trello.";
+      const resultado = [];
+      for (const board of boards.slice(0, 3)) {
+        const cards = await trelloRequest("GET", `/boards/${board.id}/cards`);
+        resultado.push(`\n📋 *${board.name}*`);
+        if (!cards || cards.length === 0) {
+          resultado.push("  Nenhum card.");
+        } else {
+          cards.slice(0, 5).forEach((c) => resultado.push(`  - ${c.name}`));
+        }
+      }
+      return resultado.join("\n");
+    }
+
+    if (nome === "criar_card_trello") {
+      const boards = await trelloRequest("GET", "/members/me/boards");
+      let listaEncontrada = null;
+      for (const board of boards) {
+        const listas = await trelloRequest("GET", `/boards/${board.id}/lists`);
+        const lista = listas.find((l) =>
+          l.name.toLowerCase().includes(input.nome_lista.toLowerCase())
+        );
+        if (lista) { listaEncontrada = lista; break; }
+      }
+      if (!listaEncontrada) return `Lista "${input.nome_lista}" não encontrada. Me diz o nome exato da lista no Trello.`;
+      const card = await trelloRequest("POST", "/cards", {
+        idList: listaEncontrada.id,
+        name: input.nome_card,
+        desc: input.descricao || "",
+      });
+      return `✅ Card "${card.name}" criado na lista "${listaEncontrada.name}"!`;
+    }
+
+    return "Ferramenta não reconhecida.";
+  } catch (err) {
+    console.error(`Erro na ferramenta ${nome}:`, err);
+    return `Erro ao executar ${nome}: ${err.message}`;
+  }
+}
 
 // ── System prompt ─────────────────────────────────────────────
 function buildSystemPrompt() {
@@ -46,45 +100,16 @@ function buildSystemPrompt() {
   return `Você é o assistente pessoal da Rayla, estratégico, direto e eficiente.
 Data e hora atual: ${agora} (horário de Brasília)
 
-Você tem acesso direto a:
-- Google Calendar: ver compromissos, criar e editar eventos
-- Gmail: buscar e-mails, criar rascunhos
-- Google Drive: buscar e ler arquivos
-- Trello: gerenciar tarefas e projetos (use a API do Trello com key=${TRELLO_API_KEY} e token=${TRELLO_TOKEN})
+Você tem acesso ao Trello para gerenciar tarefas e projetos.
 
-Quando a Rayla pedir algo, execute diretamente usando as ferramentas disponíveis sem pedir confirmação desnecessária.
-
-Seu papel é ajudá-la a:
-- Organizar a agenda e compromissos
-- Gerenciar e-mails importantes
-- Acompanhar projetos no Trello
+Seu papel é ajudar a Rayla a:
+- Organizar prioridades e manter o foco
+- Gerenciar tarefas no Trello
 - Tirar ideias do papel e transformar em ações concretas
-- Manter o foco nas prioridades do dia
+- Dar sugestões práticas e estratégicas
 
-Seja proativo: antecipe o que ela pode precisar, sugira próximos passos e ajude a executar.
-Responda sempre em português, de forma clara e direta.`;
-}
-
-// ── Chama a API do Claude com MCP ─────────────────────────────
-async function chamarClaude(mensagens) {
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "anthropic-beta": "mcp-client-2025-04-04",
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 2000,
-      system: buildSystemPrompt(),
-      messages: mensagens,
-      mcp_servers: MCP_SERVERS,
-    }),
-  });
-
-  return response.json();
+Quando o usuário pedir algo relacionado ao Trello, use as ferramentas disponíveis diretamente.
+Responda sempre em português, de forma clara e objetiva.`;
 }
 
 // ── Processa mensagem ─────────────────────────────────────────
@@ -93,14 +118,46 @@ async function processarMensagem(userId, texto) {
   historico[userId].push({ role: "user", content: texto });
 
   const mensagens = historico[userId].slice(-20);
-  const data = await chamarClaude(mensagens);
 
-  const textoResposta = data.content
-    ?.filter((b) => b.type === "text")
+  let resposta = await client.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 2000,
+    system: buildSystemPrompt(),
+    tools,
+    messages: mensagens,
+  });
+
+  while (resposta.stop_reason === "tool_use") {
+    const toolUses = resposta.content.filter((b) => b.type === "tool_use");
+    const toolResults = [];
+
+    for (const toolUse of toolUses) {
+      const resultado = await executarFerramenta(toolUse.name, toolUse.input);
+      toolResults.push({
+        type: "tool_result",
+        tool_use_id: toolUse.id,
+        content: resultado,
+      });
+    }
+
+    historico[userId].push({ role: "assistant", content: resposta.content });
+    historico[userId].push({ role: "user", content: toolResults });
+
+    resposta = await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 2000,
+      system: buildSystemPrompt(),
+      tools,
+      messages: historico[userId].slice(-20),
+    });
+  }
+
+  const textoResposta = resposta.content
+    .filter((b) => b.type === "text")
     .map((b) => b.text)
-    .join("\n") || "Não consegui processar sua mensagem.";
+    .join("\n");
 
-  if (textoResposta.trim()) {
+  if (textoResposta && textoResposta.trim()) {
     historico[userId].push({ role: "assistant", content: textoResposta });
   }
 
@@ -116,12 +173,9 @@ bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
     `Olá, Rayla! 👋 Seu assistente pessoal está pronto.\n\n` +
-    `Tenho acesso direto a:\n` +
-    `📅 Google Calendar — ver e criar eventos\n` +
-    `📧 Gmail — buscar e-mails e criar rascunhos\n` +
-    `📁 Google Drive — buscar e ler arquivos\n` +
-    `📋 Trello — ver e gerenciar tarefas\n\n` +
-    `Você também pode me mandar 🎤 áudios!\n\n` +
+    `Posso te ajudar com:\n` +
+    `📋 Trello — ver e criar tarefas\n` +
+    `💬 Conversas estratégicas — organizar ideias e prioridades\n\n` +
     `É só falar o que precisa! 😊`
   );
 });
@@ -131,41 +185,9 @@ bot.onText(/\/limpar/, (msg) => {
   bot.sendMessage(msg.chat.id, "🗑️ Histórico apagado!");
 });
 
-// ── Áudio ─────────────────────────────────────────────────────
-bot.on("voice", async (msg) => {
-  const userId = String(msg.chat.id);
-  try {
-    await bot.sendChatAction(msg.chat.id, "typing");
-    const fileUrl = await bot.getFileLink(msg.voice.file_id);
-    const audioPath = `/tmp/audio_${userId}.ogg`;
-
-    await new Promise((resolve, reject) => {
-      const file = fs.createWriteStream(audioPath);
-      https.get(fileUrl, (res) => res.pipe(file).on("finish", resolve).on("error", reject));
-    });
-
-    const transcription = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(audioPath),
-      model: "whisper-1",
-      language: "pt",
-    });
-
-    const texto = transcription.text;
-    await bot.sendMessage(msg.chat.id, `🎤 _"${texto}"_`, { parse_mode: "Markdown" });
-
-    const resposta = await processarMensagem(userId, texto);
-    if (resposta) bot.sendMessage(msg.chat.id, resposta);
-
-    try { fs.unlinkSync(audioPath); } catch {}
-  } catch (err) {
-    console.error("Erro no áudio:", err);
-    bot.sendMessage(msg.chat.id, "⚠️ Não consegui transcrever o áudio. Tenta de novo!");
-  }
-});
-
-// ── Texto ─────────────────────────────────────────────────────
+// ── Mensagens de texto ────────────────────────────────────────
 bot.on("message", async (msg) => {
-  if (msg.text?.startsWith("/") || msg.voice) return;
+  if (msg.text?.startsWith("/")) return;
   if (!msg.text) return;
 
   const userId = String(msg.chat.id);
