@@ -196,7 +196,7 @@ Para todo o resto, responda normalmente em português.`;
       // Não era JSON, resposta normal
     }
 
-    if (conteudo) historico[userId].push({ role: "assistant", content: conteudo });
+   if (conteudo && conteudo.trim()) historico[userId].push({ role: "assistant", content: conteudo });
 
     // Limita histórico a 20 mensagens para não estourar contexto
     if (historico[userId].length > 20) {
