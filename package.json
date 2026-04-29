@@ -1,7 +1,6 @@
 {
-  "name": "telegram-ai-assistant",
-  "version": "3.0.0",
-  "description": "Assistente pessoal da Rayla",
+  "name": "raylets-bot",
+  "version": "1.0.0",
   "type": "module",
   "main": "bot.js",
   "scripts": {
@@ -9,7 +8,8 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
+    "node-fetch": "^3.3.2",
     "node-telegram-bot-api": "^0.66.0",
-    "node-fetch": "^3.3.2"
+    "google-tts-api": "^2.0.2"
   }
 }
