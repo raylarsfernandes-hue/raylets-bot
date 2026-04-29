@@ -1,8 +1,5 @@
 [build]
 builder = "nixpacks"
 
-[build.nixpacksPlan.phases.install]
-cmds = ["npm install"]
-
 [start]
 cmd = "node bot.js"
