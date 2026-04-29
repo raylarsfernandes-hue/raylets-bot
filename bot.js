@@ -41,7 +41,7 @@ async function transcreverAudio(fileId) {
       authorization: ASSEMBLYAI_API_KEY,
       "content-type": "application/json",
     },
-    body: JSON.stringify({ audio_url: audioUrl, language_code: "pt" }),
+    body: JSON.stringify({ audio_url: audioUrl, language_code: "pt", speech_model: "universal-2" }),
   });
 
   const transcriptData = await transcriptRes.json();
