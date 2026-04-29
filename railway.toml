@@ -1,11 +1,8 @@
 [build]
 builder = "nixpacks"
 
-[build.nixpacksPlan.phases.setup]
-nixPkgs = ["nodejs", "python3", "ffmpeg"]
-
 [build.nixpacksPlan.phases.install]
-cmds = ["npm install", "pip install openai-whisper ffmpeg-python"]
+cmds = ["npm install"]
 
 [start]
 cmd = "node bot.js"
