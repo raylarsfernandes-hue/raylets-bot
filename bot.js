@@ -28,33 +28,29 @@ async function trelloRequest(method, path, body = null) {
   return res.json();
 }
 
-// ── AssemblyAI: transcreve áudio ──────────────────────────────
-async function transcreverAudio(filePath) {
-  const audioData = fs.readFileSync(filePath);
+// ── AssemblyAI: transcreve áudio via URL pública ──────────────
+async function transcreverAudio(fileId) {
+  // Pega a URL pública do arquivo no Telegram
+  const fileInfo = await bot.getFile(fileId);
+  const audioUrl = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${fileInfo.file_path}`;
 
-  // 1. Faz upload do arquivo
-  const uploadRes = await fetch("https://api.assemblyai.com/v2/upload", {
-    method: "POST",
-    headers: {
-      authorization: ASSEMBLYAI_API_KEY,
-      "content-type": "application/octet-stream",
-    },
-    body: audioData,
-  });
-  const { upload_url } = await uploadRes.json();
-
-  // 2. Solicita transcrição
+  // Solicita transcrição passando a URL diretamente
   const transcriptRes = await fetch("https://api.assemblyai.com/v2/transcript", {
     method: "POST",
     headers: {
       authorization: ASSEMBLYAI_API_KEY,
       "content-type": "application/json",
     },
-    body: JSON.stringify({ audio_url: upload_url, language_code: "pt" }),
+    body: JSON.stringify({ audio_url: audioUrl, language_code: "pt" }),
   });
-  const { id } = await transcriptRes.json();
 
-  // 3. Aguarda o resultado (polling)
+  const transcriptData = await transcriptRes.json();
+
+  if (transcriptData.error) throw new Error(transcriptData.error);
+
+  const { id } = transcriptData;
+
+  // Aguarda o resultado (polling)
   while (true) {
     const pollRes = await fetch(`https://api.assemblyai.com/v2/transcript/${id}`, {
       headers: { authorization: ASSEMBLYAI_API_KEY },
@@ -238,17 +234,6 @@ async function processarMensagem(userId, texto) {
   return textoResposta;
 }
 
-// ── Baixa arquivo de voz do Telegram ─────────────────────────
-async function baixarArquivoVoz(fileId) {
-  const fileInfo = await bot.getFile(fileId);
-  const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${fileInfo.file_path}`;
-  const res = await fetch(fileUrl);
-  const buffer = Buffer.from(await res.arrayBuffer());
-  const outputPath = `/tmp/voz_${Date.now()}.ogg`;
-  fs.writeFileSync(outputPath, buffer);
-  return outputPath;
-}
-
 function limparArquivo(filePath) {
   try { fs.unlinkSync(filePath); } catch (_) {}
 }
@@ -279,13 +264,12 @@ bot.on("message", async (msg) => {
 
   // Mensagem de voz
   if (msg.voice) {
-    let caminhoVoz = null;
     let caminhoAudio = null;
     try {
       await bot.sendChatAction(chatId, "typing");
-      caminhoVoz = await baixarArquivoVoz(msg.voice.file_id);
-      const transcricao = await transcreverAudio(caminhoVoz);
 
+      // Passa o fileId direto, sem baixar o arquivo
+      const transcricao = await transcreverAudio(msg.voice.file_id);
       const resposta = await processarMensagem(userId, `[Mensagem de voz]: ${transcricao}`);
 
       await bot.sendChatAction(chatId, "record_voice");
@@ -297,7 +281,6 @@ bot.on("message", async (msg) => {
       console.error("Erro no áudio:", err);
       bot.sendMessage(chatId, "⚠️ Não consegui processar o áudio. Tenta de novo!");
     } finally {
-      if (caminhoVoz) limparArquivo(caminhoVoz);
       if (caminhoAudio) limparArquivo(caminhoAudio);
     }
     return;
