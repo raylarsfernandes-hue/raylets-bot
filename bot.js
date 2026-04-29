@@ -3,6 +3,10 @@ import TelegramBot from "node-telegram-bot-api";
 import fetch from "node-fetch";
 import fs from "fs";
 import googleTTS from "google-tts-api";
+import { exec } from "child_process";
+import { promisify } from "util";
+
+const execAsync = promisify(exec);
 
 // ============================================================
 // VARIÁVEIS DE AMBIENTE
@@ -11,13 +15,11 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const TRELLO_API_KEY = process.env.TRELLO_API_KEY;
 const TRELLO_TOKEN = process.env.TRELLO_TOKEN;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 // ============================================================
 
 const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-// Histórico por usuário
 const historico = {};
 
 // ── Trello ────────────────────────────────────────────────────
@@ -29,29 +31,17 @@ async function trelloRequest(method, path, body = null) {
   return res.json();
 }
 
-// ── Whisper: transcreve áudio ─────────────────────────────────
+// ── Whisper local: transcreve áudio via Python ────────────────
 async function transcreverAudio(filePath) {
-  const fileBuffer = fs.readFileSync(filePath);
-  const formData = new FormData();
-  const fileBlob = new Blob([fileBuffer], { type: "audio/ogg" });
-  formData.append("file", fileBlob, "audio.ogg");
-  formData.append("model", "whisper-1");
-  formData.append("language", "pt");
-
-  const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: formData,
-  });
-
-  const data = await res.json();
-  if (data.error) throw new Error(data.error.message);
-  return data.text;
+  const { stdout, stderr } = await execAsync(`python3 transcribe.py "${filePath}"`);
+  if (stderr) console.error("Whisper stderr:", stderr);
+  const resultado = JSON.parse(stdout);
+  if (resultado.error) throw new Error(resultado.error);
+  return resultado.text;
 }
 
 // ── gTTS: converte texto em áudio (gratuito, sem API key) ─────
 async function gerarAudio(texto) {
-  // Divide em partes de até 200 chars (limite do gTTS)
   const urls = googleTTS.getAllAudioUrls(texto, {
     lang: "pt",
     slow: false,
@@ -241,7 +231,7 @@ bot.onText(/\/start/, (msg) => {
     msg.chat.id,
     `Olá, Rayla! 👋 Raylets está pronta.\n\n` +
     `📋 Trello — ver e criar tarefas\n` +
-    `🎙️ Áudio — manda voz e eu respondo em áudio\n` +
+    `🎙️ Áudio — manda voz e eu transcrevo e respondo\n` +
     `💬 Por padrão respondo em texto. Só pedir pra responder em áudio!`
   );
 });
