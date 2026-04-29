@@ -18,20 +18,18 @@ const MAKE_WEBHOOK_URL = "https://hook.us2.make.com/82qv379dubrauwe57jhbxx7ofxjg
 const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-const historico = {};
-
-// ── Envia mensagem pro Make e aguarda resposta ────────────────
-async function processarViaMake(userId, chatId, texto) {
-  const res = await fetch(MAKE_WEBHOOK_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ userId, chatId, texto }),
-  });
-
-  if (!res.ok) throw new Error(`Make retornou status ${res.status}`);
-
-  const data = await res.json();
-  return data.resposta || null;
+// ── Envia mensagem pro Make sem esperar resposta ──────────────
+async function enviarParaMake(userId, chatId, texto) {
+  try {
+    await fetch(MAKE_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId, chatId: String(chatId), texto }),
+    });
+  } catch (err) {
+    console.error("Erro ao enviar pro Make:", err);
+    throw err;
+  }
 }
 
 // ── AssemblyAI: transcreve áudio via URL pública ──────────────
@@ -113,7 +111,6 @@ bot.onText(/\/start/, (msg) => {
 });
 
 bot.onText(/\/limpar/, (msg) => {
-  historico[String(msg.chat.id)] = [];
   bot.sendMessage(msg.chat.id, "🗑️ Histórico apagado!");
 });
 
@@ -127,53 +124,32 @@ bot.on("message", async (msg) => {
 
   // Mensagem de voz
   if (msg.voice) {
-    let caminhoAudio = null;
     try {
       await bot.sendChatAction(chatId, "typing");
       const transcricao = await transcreverAudio(msg.voice.file_id);
 
       await bot.sendMessage(chatId, `🎙️ _Você disse:_ "${transcricao}"`, { parse_mode: "Markdown" });
+      await bot.sendMessage(chatId, "⏳ Processando...");
 
-      await bot.sendChatAction(chatId, "typing");
-      const resposta = await processarViaMake(userId, chatId, transcricao);
-
-      if (resposta) {
-        await bot.sendChatAction(chatId, "record_voice");
-        caminhoAudio = await gerarAudio(resposta);
-        await bot.sendVoice(chatId, caminhoAudio);
-      }
+      // Manda pro Make com flag de áudio
+      await enviarParaMake(userId, chatId, transcricao + " [responder_em_audio]");
 
     } catch (err) {
       console.error("Erro no áudio:", err);
       bot.sendMessage(chatId, "⚠️ Não consegui processar o áudio. Tenta de novo!");
-    } finally {
-      if (caminhoAudio) limparArquivo(caminhoAudio);
     }
     return;
   }
 
   // Mensagem de texto
   if (msg.text) {
-    const pedindoAudio = detectaQueroAudio(msg.text);
-    let caminhoAudio = null;
     try {
       await bot.sendChatAction(chatId, "typing");
-      const resposta = await processarViaMake(userId, chatId, msg.text);
-
-      if (!resposta) return;
-
-      if (pedindoAudio) {
-        await bot.sendChatAction(chatId, "record_voice");
-        caminhoAudio = await gerarAudio(resposta);
-        await bot.sendVoice(chatId, caminhoAudio);
-      } else {
-        bot.sendMessage(chatId, resposta);
-      }
+      await bot.sendMessage(chatId, "⏳ Processando...");
+      await enviarParaMake(userId, chatId, msg.text);
     } catch (err) {
       console.error("Erro:", err);
       bot.sendMessage(chatId, "⚠️ Ocorreu um erro. Tenta de novo!");
-    } finally {
-      if (caminhoAudio) limparArquivo(caminhoAudio);
     }
   }
 });
