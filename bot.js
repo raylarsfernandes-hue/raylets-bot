@@ -1,7 +1,8 @@
 import Anthropic from "@anthropic-ai/sdk";
 import TelegramBot from "node-telegram-bot-api";
-import fs from "fs";
 import fetch from "node-fetch";
+import fs from "fs";
+import googleTTS from "google-tts-api";
 
 // ============================================================
 // VARIÁVEIS DE AMBIENTE
@@ -10,6 +11,7 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const TRELLO_API_KEY = process.env.TRELLO_API_KEY;
 const TRELLO_TOKEN = process.env.TRELLO_TOKEN;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 // ============================================================
 
 const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
@@ -25,6 +27,48 @@ async function trelloRequest(method, path, body = null) {
   if (body) options.body = JSON.stringify(body);
   const res = await fetch(url, options);
   return res.json();
+}
+
+// ── Whisper: transcreve áudio ─────────────────────────────────
+async function transcreverAudio(filePath) {
+  const fileBuffer = fs.readFileSync(filePath);
+  const formData = new FormData();
+  const fileBlob = new Blob([fileBuffer], { type: "audio/ogg" });
+  formData.append("file", fileBlob, "audio.ogg");
+  formData.append("model", "whisper-1");
+  formData.append("language", "pt");
+
+  const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: formData,
+  });
+
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+  return data.text;
+}
+
+// ── gTTS: converte texto em áudio (gratuito, sem API key) ─────
+async function gerarAudio(texto) {
+  // Divide em partes de até 200 chars (limite do gTTS)
+  const urls = googleTTS.getAllAudioUrls(texto, {
+    lang: "pt",
+    slow: false,
+    host: "https://translate.google.com",
+  });
+
+  const chunks = [];
+  for (const item of urls) {
+    const res = await fetch(item.url);
+    const buffer = await res.buffer();
+    chunks.push(buffer);
+  }
+
+  const audioBuffer = Buffer.concat(chunks);
+  const outputPath = `/tmp/raylets_resposta_${Date.now()}.mp3`;
+  fs.writeFileSync(outputPath, audioBuffer);
+  return outputPath;
 }
 
 // ── Tools para o Claude ───────────────────────────────────────
@@ -84,7 +128,7 @@ async function executarFerramenta(nome, input) {
         name: input.nome_card,
         desc: input.descricao || "",
       });
-      return `✅ Card "${card.name}" criado na lista "${listaEncontrada.name}"!`;
+      return `Card "${card.name}" criado na lista "${listaEncontrada.name}"!`;
     }
 
     return "Ferramenta não reconhecida.";
@@ -97,7 +141,7 @@ async function executarFerramenta(nome, input) {
 // ── System prompt ─────────────────────────────────────────────
 function buildSystemPrompt() {
   const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" });
-  return `Você é o assistente pessoal da Rayla, estratégico, direto e eficiente.
+  return `Você é Raylets, assistente pessoal da Rayla — estratégica, direta e eficiente.
 Data e hora atual: ${agora} (horário de Brasília)
 
 Você tem acesso ao Trello para gerenciar tarefas e projetos.
@@ -109,7 +153,17 @@ Seu papel é ajudar a Rayla a:
 - Dar sugestões práticas e estratégicas
 
 Quando o usuário pedir algo relacionado ao Trello, use as ferramentas disponíveis diretamente.
-Responda sempre em português, de forma clara e objetiva.`;
+Responda sempre em português, de forma clara e objetiva.
+Quando for responder em áudio, use apenas texto corrido e natural, sem emojis, markdown, asteriscos ou símbolos.`;
+}
+
+// ── Detecta pedido de resposta em áudio ───────────────────────
+function detectaQueroAudio(texto) {
+  const frases = [
+    "responde em áudio", "responda em áudio", "manda áudio", "me manda um áudio",
+    "fala em áudio", "quero áudio", "pode falar", "me fala",
+  ];
+  return frases.some((f) => texto.toLowerCase().includes(f));
 }
 
 // ── Processa mensagem ─────────────────────────────────────────
@@ -117,14 +171,12 @@ async function processarMensagem(userId, texto) {
   if (!historico[userId]) historico[userId] = [];
   historico[userId].push({ role: "user", content: texto });
 
-  const mensagens = historico[userId].slice(-20);
-
   let resposta = await client.messages.create({
     model: "claude-sonnet-4-6",
     max_tokens: 2000,
     system: buildSystemPrompt(),
     tools,
-    messages: mensagens,
+    messages: historico[userId].slice(-20),
   });
 
   while (resposta.stop_reason === "tool_use") {
@@ -157,7 +209,7 @@ async function processarMensagem(userId, texto) {
     .map((b) => b.text)
     .join("\n");
 
-  if (textoResposta && textoResposta.trim()) {
+  if (textoResposta?.trim()) {
     historico[userId].push({ role: "assistant", content: textoResposta });
   }
 
@@ -168,15 +220,29 @@ async function processarMensagem(userId, texto) {
   return textoResposta;
 }
 
+// ── Baixa arquivo de voz do Telegram ─────────────────────────
+async function baixarArquivoVoz(fileId) {
+  const fileInfo = await bot.getFile(fileId);
+  const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${fileInfo.file_path}`;
+  const res = await fetch(fileUrl);
+  const buffer = await res.buffer();
+  const outputPath = `/tmp/voz_${Date.now()}.ogg`;
+  fs.writeFileSync(outputPath, buffer);
+  return outputPath;
+}
+
+function limparArquivo(filePath) {
+  try { fs.unlinkSync(filePath); } catch (_) {}
+}
+
 // ── Comandos ──────────────────────────────────────────────────
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    `Olá, Rayla! 👋 Seu assistente pessoal está pronto.\n\n` +
-    `Posso te ajudar com:\n` +
+    `Olá, Rayla! 👋 Raylets está pronta.\n\n` +
     `📋 Trello — ver e criar tarefas\n` +
-    `💬 Conversas estratégicas — organizar ideias e prioridades\n\n` +
-    `É só falar o que precisa! 😊`
+    `🎙️ Áudio — manda voz e eu respondo em áudio\n` +
+    `💬 Por padrão respondo em texto. Só pedir pra responder em áudio!`
   );
 });
 
@@ -185,20 +251,62 @@ bot.onText(/\/limpar/, (msg) => {
   bot.sendMessage(msg.chat.id, "🗑️ Histórico apagado!");
 });
 
-// ── Mensagens de texto ────────────────────────────────────────
+// ── Listener principal ────────────────────────────────────────
 bot.on("message", async (msg) => {
   if (msg.text?.startsWith("/")) return;
-  if (!msg.text) return;
+  if (!msg.text && !msg.voice) return;
 
   const userId = String(msg.chat.id);
-  try {
-    await bot.sendChatAction(msg.chat.id, "typing");
-    const resposta = await processarMensagem(userId, msg.text);
-    if (resposta) bot.sendMessage(msg.chat.id, resposta);
-  } catch (err) {
-    console.error("Erro:", err);
-    bot.sendMessage(msg.chat.id, "⚠️ Ocorreu um erro. Tenta de novo!");
+  const chatId = msg.chat.id;
+
+  // Mensagem de voz
+  if (msg.voice) {
+    let caminhoVoz = null;
+    let caminhoAudio = null;
+    try {
+      await bot.sendChatAction(chatId, "typing");
+      caminhoVoz = await baixarArquivoVoz(msg.voice.file_id);
+      const transcricao = await transcreverAudio(caminhoVoz);
+
+      const resposta = await processarMensagem(userId, `[Mensagem de voz]: ${transcricao}`);
+
+      await bot.sendChatAction(chatId, "record_voice");
+      caminhoAudio = await gerarAudio(resposta);
+      await bot.sendVoice(chatId, caminhoAudio);
+      await bot.sendMessage(chatId, `🎙️ _Você disse:_ "${transcricao}"`, { parse_mode: "Markdown" });
+
+    } catch (err) {
+      console.error("Erro no áudio:", err);
+      bot.sendMessage(chatId, "⚠️ Não consegui processar o áudio. Tenta de novo!");
+    } finally {
+      if (caminhoVoz) limparArquivo(caminhoVoz);
+      if (caminhoAudio) limparArquivo(caminhoAudio);
+    }
+    return;
+  }
+
+  // Mensagem de texto
+  if (msg.text) {
+    const pedindoAudio = detectaQueroAudio(msg.text);
+    let caminhoAudio = null;
+    try {
+      await bot.sendChatAction(chatId, "typing");
+      const resposta = await processarMensagem(userId, msg.text);
+
+      if (pedindoAudio) {
+        await bot.sendChatAction(chatId, "record_voice");
+        caminhoAudio = await gerarAudio(resposta);
+        await bot.sendVoice(chatId, caminhoAudio);
+      } else {
+        if (resposta) bot.sendMessage(chatId, resposta);
+      }
+    } catch (err) {
+      console.error("Erro:", err);
+      bot.sendMessage(chatId, "⚠️ Ocorreu um erro. Tenta de novo!");
+    } finally {
+      if (caminhoAudio) limparArquivo(caminhoAudio);
+    }
   }
 });
 
-console.log("🤖 Assistente da Rayla iniciado!");
+console.log("🤖 Raylets iniciada!");
