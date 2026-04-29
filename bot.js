@@ -3,10 +3,6 @@ import TelegramBot from "node-telegram-bot-api";
 import fetch from "node-fetch";
 import fs from "fs";
 import googleTTS from "google-tts-api";
-import { exec } from "child_process";
-import { promisify } from "util";
-
-const execAsync = promisify(exec);
 
 // ============================================================
 // VARIÁVEIS DE AMBIENTE
@@ -15,6 +11,7 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const TRELLO_API_KEY = process.env.TRELLO_API_KEY;
 const TRELLO_TOKEN = process.env.TRELLO_TOKEN;
+const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY;
 // ============================================================
 
 const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
@@ -31,13 +28,44 @@ async function trelloRequest(method, path, body = null) {
   return res.json();
 }
 
-// ── Whisper local: transcreve áudio via Python ────────────────
+// ── AssemblyAI: transcreve áudio ──────────────────────────────
 async function transcreverAudio(filePath) {
-  const { stdout, stderr } = await execAsync(`python3 transcribe.py "${filePath}"`);
-  if (stderr) console.error("Whisper stderr:", stderr);
-  const resultado = JSON.parse(stdout);
-  if (resultado.error) throw new Error(resultado.error);
-  return resultado.text;
+  const audioData = fs.readFileSync(filePath);
+
+  // 1. Faz upload do arquivo
+  const uploadRes = await fetch("https://api.assemblyai.com/v2/upload", {
+    method: "POST",
+    headers: {
+      authorization: ASSEMBLYAI_API_KEY,
+      "content-type": "application/octet-stream",
+    },
+    body: audioData,
+  });
+  const { upload_url } = await uploadRes.json();
+
+  // 2. Solicita transcrição
+  const transcriptRes = await fetch("https://api.assemblyai.com/v2/transcript", {
+    method: "POST",
+    headers: {
+      authorization: ASSEMBLYAI_API_KEY,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ audio_url: upload_url, language_code: "pt" }),
+  });
+  const { id } = await transcriptRes.json();
+
+  // 3. Aguarda o resultado (polling)
+  while (true) {
+    const pollRes = await fetch(`https://api.assemblyai.com/v2/transcript/${id}`, {
+      headers: { authorization: ASSEMBLYAI_API_KEY },
+    });
+    const data = await pollRes.json();
+
+    if (data.status === "completed") return data.text;
+    if (data.status === "error") throw new Error(data.error);
+
+    await new Promise((r) => setTimeout(r, 2000));
+  }
 }
 
 // ── gTTS: converte texto em áudio (gratuito, sem API key) ─────
@@ -51,7 +79,7 @@ async function gerarAudio(texto) {
   const chunks = [];
   for (const item of urls) {
     const res = await fetch(item.url);
-    const buffer = await res.buffer();
+    const buffer = Buffer.from(await res.arrayBuffer());
     chunks.push(buffer);
   }
 
@@ -215,7 +243,7 @@ async function baixarArquivoVoz(fileId) {
   const fileInfo = await bot.getFile(fileId);
   const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${fileInfo.file_path}`;
   const res = await fetch(fileUrl);
-  const buffer = await res.buffer();
+  const buffer = Buffer.from(await res.arrayBuffer());
   const outputPath = `/tmp/voz_${Date.now()}.ogg`;
   fs.writeFileSync(outputPath, buffer);
   return outputPath;
