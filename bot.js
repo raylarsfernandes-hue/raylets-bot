@@ -12,7 +12,7 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const TRELLO_API_KEY = process.env.TRELLO_API_KEY;
 const TRELLO_TOKEN = process.env.TRELLO_TOKEN;
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY;
-const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL;
+const MAKE_WEBHOOK_URL = "https://hook.us2.make.com/82qv379dubrauwe57jhbxx7ofxjgjlzg";
 // ============================================================
 
 const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
